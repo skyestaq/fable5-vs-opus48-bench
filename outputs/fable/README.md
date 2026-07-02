@@ -1,4 +1,6 @@
 # Run A — claude-fable-5
 
-The deliverable HTML file from the Fable 5 session will be placed here, untouched,
-after the benchmark run. See [`../../run-conditions.md`](../../run-conditions.md).
+Deliverable: [`hexagon-bounce.html`](hexagon-bounce.html) — committed untouched,
+exactly as produced by the model. Open it directly in any modern browser.
+
+See [`../../run-conditions.md`](../../run-conditions.md) for the full protocol.

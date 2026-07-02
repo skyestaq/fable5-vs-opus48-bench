@@ -1,4 +1,6 @@
 # Run B — claude-opus-4-8
 
-The deliverable HTML file from the Opus 4.8 session will be placed here, untouched,
-after the benchmark run. See [`../../run-conditions.md`](../../run-conditions.md).
+Deliverable: [`hexagon-balls.html`](hexagon-balls.html) — committed untouched,
+exactly as produced by the model. Open it directly in any modern browser.
+
+See [`../../run-conditions.md`](../../run-conditions.md) for the full protocol.
