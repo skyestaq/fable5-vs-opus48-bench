@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bouncing Balls in a Rotating Hexagon</title>
+<!--
+==================================================================================
+  ROTATING HEXAGON + BOUNCING BALLS — physics simulation (single self-contained file)
+==================================================================================
+
+  ASSUMPTIONS (reasonable choices made without asking):
+  --------------------------------------------------------------------------------
+  * Units are pixels for length and seconds for time. Gravity points down (+y).
+  * Ball MASS is proportional to AREA (radius^2). This makes momentum transfer in
+    ball-ball collisions feel size-appropriate in a 2D world.
+  * ENERGY LOSS is modeled via a coefficient of restitution slightly below 1 on
+    every collision (walls and ball-ball). Combined with gravity this lets the
+    system settle instead of gaining energy. The rotating wall CAN add energy at
+    contact (that is physically correct — a moving wall does work on the ball),
+    so a stationary/slow hexagon lets balls settle; a fast one keeps them lively.
+  * The hexagon is a REGULAR hexagon centered on the canvas, radius scaled to the
+    viewport. It rotates at a constant angular velocity set live by the slider.
+  * TUNNELING PREVENTION: physics runs in several fixed-size sub-steps per frame,
+    positions are hard-corrected out of penetration every sub-step, and velocities
+    are clamped. This guarantees no ball passes through a wall or another ball.
+  * On restart, ball count is fixed at 10 but sizes/colors/positions are random.
+  * Rotation speed slider is in radians/second and may be negative (reverse spin).
+
+  COLLISION APPROACH (see inline comments for the math):
+  --------------------------------------------------------------------------------
+  * The hexagon is treated as 6 line-segment walls. For each wall we know an inward
+    unit normal. A ball penetrates when its signed distance to the wall line is less
+    than its radius. We (a) push it back onto the surface, then (b) reflect the
+    component of its velocity RELATIVE TO THE MOVING WALL along the normal, so the
+    wall's rotational velocity at the contact point is accounted for in the bounce.
+  * Ball-ball collisions use the standard impulse formulation along the line of
+    centers with per-ball inverse mass, plus positional correction to remove overlap.
+==================================================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0d12; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
+  #canvas { display: block; width: 100vw; height: 100vh; }
+
+  #panel {
+    position: fixed; top: 16px; left: 16px; z-index: 10;
+    display: flex; align-items: center; gap: 18px;
+    padding: 12px 16px;
+    background: rgba(20, 24, 34, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 12px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #e6e9f0;
+    font-size: 13px;
+    user-select: none;
+  }
+  #panel .group { display: flex; align-items: center; gap: 9px; }
+  #panel label { color: #9aa3b2; white-space: nowrap; }
+
+  button#restart {
+    appearance: none; cursor: pointer;
+    padding: 7px 15px;
+    background: #2b6cff; color: #fff;
+    border: none; border-radius: 8px;
+    font-size: 13px; font-weight: 600;
+    transition: background 0.15s ease, transform 0.05s ease;
+  }
+  button#restart:hover { background: #3f7bff; }
+  button#restart:active { transform: translateY(1px); }
+
+  input[type="range"] {
+    width: 180px; accent-color: #2b6cff; cursor: pointer;
+  }
+  #speedVal {
+    min-width: 58px; text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: #cfd6e4;
+  }
+</style>
+</head>
+<body>
+  <div id="panel">
+    <button id="restart">Restart</button>
+    <div class="group">
+      <label for="speed">Rotation</label>
+      <input id="speed" type="range" min="-2.5" max="2.5" step="0.01" value="0.6">
+      <span id="speedVal">0.60 rad/s</span>
+    </div>
+  </div>
+  <canvas id="canvas"></canvas>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------------------
+  // Canvas + viewport setup (handles high-DPI displays and live resizing)
+  // ---------------------------------------------------------------------------
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+
+  let W = 0, H = 0, DPR = 1;
+  let cx = 0, cy = 0;      // hexagon center (canvas center)
+  let hexR = 0;           // hexagon circumradius (vertex distance from center)
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width  = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    cx = W / 2;
+    cy = H / 2;
+    hexR = Math.min(W, H) * 0.42;   // scales the hexagon to the viewport
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------------------------------------------------------------------------
+  // Simulation constants
+  // ---------------------------------------------------------------------------
+  const NUM_BALLS   = 10;
+  const GRAVITY     = 1500;   // px/s^2, downward
+  const WALL_REST   = 0.86;   // restitution against walls (<1 => energy loss)
+  const BALL_REST   = 0.90;   // restitution between balls (<1 => energy loss)
+  const AIR_DRAG    = 0.9995;  // tiny per-substep velocity damping (settling)
+  const MAX_SPEED   = 2600;   // hard velocity clamp — stability safeguard
+  const SUBSTEPS    = 8;      // fixed sub-steps per frame => no tunneling
+  const SOLVER_ITERS= 3;      // constraint relaxation iterations per sub-step
+
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+  let balls = [];
+  let hexAngle = 0;          // current rotation angle of the hexagon (radians)
+  let omega = 0.6;           // angular velocity (radians/second), from slider
+
+  const COLORS = [
+    "#ff5d5d", "#ffb23e", "#ffe14d", "#7dff6b", "#43e0c8",
+    "#4ea8ff", "#7c6bff", "#c86bff", "#ff6bd0", "#ff9d6b"
+  ];
+
+  function rand(min, max) { return min + Math.random() * (max - min); }
+
+  // Distance from center to the middle of a hexagon edge (apothem / inradius).
+  // Balls must spawn inside this so they start fully within the walls.
+  function inradius() { return hexR * Math.cos(Math.PI / 6); }
+
+  // Create the balls with random sizes/colors, non-overlapping, inside the hexagon.
+  function initBalls() {
+    balls = [];
+    const safe = inradius();
+    let guard = 0;
+    while (balls.length < NUM_BALLS && guard < 5000) {
+      guard++;
+      const r = rand(9, 24);
+      // random point inside a disk of radius (safe - r) so the whole ball fits
+      const maxRad = safe - r - 4;
+      const ang = rand(0, Math.PI * 2);
+      const rad = Math.sqrt(Math.random()) * maxRad;
+      const x = cx + Math.cos(ang) * rad;
+      const y = cy + Math.sin(ang) * rad;
+
+      // reject if it overlaps an existing ball
+      let ok = true;
+      for (const b of balls) {
+        const dx = b.x - x, dy = b.y - y;
+        if (Math.hypot(dx, dy) < b.r + r + 2) { ok = false; break; }
+      }
+      if (!ok) continue;
+
+      balls.push({
+        x, y,
+        vx: rand(-120, 120),
+        vy: rand(-120, 120),
+        r,
+        mass: r * r,          // mass ~ area
+        invM: 1 / (r * r),
+        color: COLORS[balls.length % COLORS.length]
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hexagon geometry for a given rotation angle.
+  // Returns the 6 vertices and, for each edge, an inward unit normal + a point
+  // on the edge. Vertices are generated in order around the center.
+  // ---------------------------------------------------------------------------
+  function hexGeometry(angle) {
+    const verts = [];
+    for (let i = 0; i < 6; i++) {
+      const a = angle + i * Math.PI / 3;   // 60° apart
+      verts.push({ x: cx + Math.cos(a) * hexR, y: cy + Math.sin(a) * hexR });
+    }
+    const edges = [];
+    for (let i = 0; i < 6; i++) {
+      const p1 = verts[i];
+      const p2 = verts[(i + 1) % 6];
+      // Edge direction, then a perpendicular candidate for the normal.
+      let nx = -(p2.y - p1.y);
+      let ny =  (p2.x - p1.x);
+      const len = Math.hypot(nx, ny) || 1;
+      nx /= len; ny /= len;
+      // Ensure the normal points INWARD (toward the hexagon center).
+      const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+      if ((cx - mx) * nx + (cy - my) * ny < 0) { nx = -nx; ny = -ny; }
+      edges.push({ p1, nx, ny });
+    }
+    return { verts, edges };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ball vs moving-wall collision.
+  //   * signed distance d of ball center from the wall line (along inward normal)
+  //   * if d < r the ball penetrates by (r - d): push it back out along n
+  //   * the wall point at the contact moves with velocity  omega × (contact - center);
+  //     we reflect the ball's velocity RELATIVE to that wall velocity, so the
+  //     spinning wall correctly imparts tangential/normal motion to the ball.
+  // ---------------------------------------------------------------------------
+  function resolveWalls(b, edges) {
+    for (const e of edges) {
+      const d = (b.x - e.p1.x) * e.nx + (b.y - e.p1.y) * e.ny; // signed dist
+      if (d < b.r) {
+        // (a) positional correction: move ball back onto the surface
+        const push = b.r - d;
+        b.x += e.nx * push;
+        b.y += e.ny * push;
+
+        // Contact point on the wall line (closest point to the ball center,
+        // computed from the pre-push distance for a stable normal direction).
+        const contactX = b.x - e.nx * b.r;
+        const contactY = b.y - e.ny * b.r;
+
+        // Velocity of the rotating wall at the contact point:
+        //   v = omega * (0,0,1) × (contact - center)  =  omega*(-ry, rx)
+        const rxp = contactX - cx;
+        const ryp = contactY - cy;
+        const wallVx = -omega * ryp;
+        const wallVy =  omega * rxp;
+
+        // Relative velocity of ball w.r.t. the moving wall.
+        const rvx = b.vx - wallVx;
+        const rvy = b.vy - wallVy;
+        const vn = rvx * e.nx + rvy * e.ny;   // normal component (inward = +)
+
+        // Only respond if the ball is moving INTO the wall (vn < 0).
+        if (vn < 0) {
+          const j = -(1 + WALL_REST) * vn;    // scalar impulse along normal
+          // new velocity = wall velocity + reflected relative velocity
+          b.vx = wallVx + rvx + j * e.nx;
+          b.vy = wallVy + rvy + j * e.ny;
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ball vs ball collision — impulse along the line of centers, with mass
+  // weighting (momentum transfer scales with the balls' sizes) and positional
+  // correction to remove any overlap so balls never pass through one another.
+  // ---------------------------------------------------------------------------
+  function resolvePair(a, b) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let dist = Math.hypot(dx, dy);
+    const minDist = a.r + b.r;
+    if (dist >= minDist) return;
+
+    // Guard against exact overlap (dist == 0): nudge along a fixed axis.
+    if (dist === 0) { dx = 1; dy = 0; dist = 0.0001; }
+
+    const nx = dx / dist, ny = dy / dist;           // unit line of centers
+    const overlap = minDist - dist;
+    const invSum = a.invM + b.invM;
+
+    // Positional correction, split by inverse mass (lighter ball moves more).
+    const corrA = overlap * (a.invM / invSum);
+    const corrB = overlap * (b.invM / invSum);
+    a.x -= nx * corrA; a.y -= ny * corrA;
+    b.x += nx * corrB; b.y += ny * corrB;
+
+    // Impulse: reflect the relative normal velocity, scaled by restitution.
+    const rvx = b.vx - a.vx;
+    const rvy = b.vy - a.vy;
+    const vn = rvx * nx + rvy * ny;
+    if (vn > 0) return; // already separating
+
+    const j = -(1 + BALL_REST) * vn / invSum;
+    const ix = j * nx, iy = j * ny;
+    a.vx -= ix * a.invM; a.vy -= iy * a.invM;
+    b.vx += ix * b.invM; b.vy += iy * b.invM;
+  }
+
+  function clampSpeed(b) {
+    const s = Math.hypot(b.vx, b.vy);
+    if (s > MAX_SPEED) {
+      const k = MAX_SPEED / s;
+      b.vx *= k; b.vy *= k;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fixed-timestep physics sub-step
+  // ---------------------------------------------------------------------------
+  function substep(dt) {
+    // Advance the hexagon's rotation.
+    hexAngle += omega * dt;
+    const geo = hexGeometry(hexAngle);
+
+    // Integrate: apply gravity + light drag, then move.
+    for (const b of balls) {
+      b.vx *= AIR_DRAG;
+      b.vy = b.vy * AIR_DRAG + GRAVITY * dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+    }
+
+    // Relax constraints a few times so stacked/cornered balls settle without
+    // penetrating. Walls are resolved last each iteration so the frame always
+    // ends with every ball strictly inside the hexagon.
+    for (let it = 0; it < SOLVER_ITERS; it++) {
+      for (let i = 0; i < balls.length; i++) {
+        for (let k = i + 1; k < balls.length; k++) {
+          resolvePair(balls[i], balls[k]);
+        }
+      }
+      for (const b of balls) resolveWalls(b, geo.edges);
+    }
+
+    for (const b of balls) clampSpeed(b);
+    return geo;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rendering
+  // ---------------------------------------------------------------------------
+  function draw(geo) {
+    ctx.clearRect(0, 0, W, H);
+
+    // subtle vignette background
+    ctx.fillStyle = "#0b0d12";
+    ctx.fillRect(0, 0, W, H);
+
+    // Hexagon
+    ctx.beginPath();
+    ctx.moveTo(geo.verts[0].x, geo.verts[0].y);
+    for (let i = 1; i < 6; i++) ctx.lineTo(geo.verts[i].x, geo.verts[i].y);
+    ctx.closePath();
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(120, 150, 210, 0.9)";
+    ctx.shadowColor = "rgba(80, 130, 255, 0.55)";
+    ctx.shadowBlur = 18;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Balls
+    for (const b of balls) {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+      ctx.fillStyle = b.color;
+      ctx.fill();
+      // simple highlight for a bit of dimension
+      ctx.beginPath();
+      ctx.arc(b.x - b.r * 0.3, b.y - b.r * 0.3, b.r * 0.35, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.28)";
+      ctx.fill();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Main loop — requestAnimationFrame with clamped, sub-divided timestep
+  // ---------------------------------------------------------------------------
+  let lastT = performance.now();
+  function frame(now) {
+    // Clamp frame dt (e.g. after a background tab) so physics never explodes.
+    let dt = (now - lastT) / 1000;
+    lastT = now;
+    if (dt > 1 / 30) dt = 1 / 30;   // cap at ~33ms
+    if (dt < 0) dt = 0;
+
+    const sub = dt / SUBSTEPS;
+    let geo;
+    for (let s = 0; s < SUBSTEPS; s++) geo = substep(sub);
+
+    draw(geo);
+    requestAnimationFrame(frame);
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI wiring
+  // ---------------------------------------------------------------------------
+  const speedSlider = document.getElementById("speed");
+  const speedVal = document.getElementById("speedVal");
+  function updateSpeedLabel() {
+    speedVal.textContent = Number(speedSlider.value).toFixed(2) + " rad/s";
+  }
+  speedSlider.addEventListener("input", () => {
+    omega = parseFloat(speedSlider.value);   // live control, no restart needed
+    updateSpeedLabel();
+  });
+  omega = parseFloat(speedSlider.value);
+  updateSpeedLabel();
+
+  document.getElementById("restart").addEventListener("click", () => {
+    resize();      // re-fit in case the window changed
+    initBalls();
+  });
+
+  // Re-fit balls if the viewport resized enough to matter.
+  window.addEventListener("resize", () => {
+    // keep balls inside the (possibly smaller) hexagon after a resize
+    const safe = inradius();
+    for (const b of balls) {
+      const dx = b.x - cx, dy = b.y - cy;
+      const dist = Math.hypot(dx, dy);
+      const maxD = safe - b.r - 2;
+      if (dist > maxD && dist > 0) {
+        b.x = cx + dx / dist * maxD;
+        b.y = cy + dy / dist * maxD;
+      }
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Go
+  // ---------------------------------------------------------------------------
+  initBalls();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
